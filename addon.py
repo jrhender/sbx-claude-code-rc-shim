@@ -56,6 +56,25 @@ DEBUG = os.environ.get("SHIM_DEBUG") == "1"
 # one-off sentinel discovery in your own sandbox -- turn it back off afterwards.
 REVEAL_CRED = os.environ.get("SHIM_REVEAL_CRED") == "1"
 
+# Inbound RC messages from a remote client (e.g. the mobile app) arrive on the
+# events SSE stream prefixed, server-side, with
+#   <system-reminder>Message sent at <ts> UTC.</system-reminder>\n
+# That text is injected upstream (it is NOT in the local Claude Code bundle), so
+# it travels the wire through this shim. The leading line breaks slash-commands
+# like /clear, which must be the first characters of the message. With
+# SHIM_STRIP_MSG_TIMESTAMP=1 (default) the shim removes just that one reminder
+# (and its trailing newline) from inbound event payloads; every other
+# system-reminder is left untouched. Set =0 to keep the timestamp.
+STRIP_MSG_TIMESTAMP = os.environ.get("SHIM_STRIP_MSG_TIMESTAMP", "1") != "0"
+
+# Matches the server-injected timestamp reminder inside the JSON-encoded SSE
+# payload. On the wire the trailing newline is JSON-escaped as the two bytes
+# \n, so accept either that or a real newline. [^<]*? keeps the match from
+# crossing into any following tag, so only this reminder is ever removed.
+_MSG_TS_RE = re.compile(
+    rb"<system-reminder>Message sent at [^<]*?</system-reminder>(?:\\n|\n)?"
+)
+
 logger = logging.getLogger("scoped-shim")
 logger.propagate = False
 
@@ -126,16 +145,32 @@ def requestheaders(flow: http.HTTPFlow) -> None:
     )
 
 
+def _strip_msg_timestamp(chunk: bytes) -> bytes:
+    # mitmproxy streaming modifier: called per response chunk (and once with b""
+    # at end-of-stream). Removing a fully-matched reminder is safe; in the rare
+    # case one is split across a chunk boundary it simply isn't stripped that
+    # time (degrades to the old behaviour) rather than corrupting the stream.
+    return _MSG_TS_RE.sub(b"", chunk)
+
+
 def responseheaders(flow: http.HTTPFlow) -> None:
     # Stream Server-Sent-Events instead of buffering. mitmproxy otherwise waits
     # for the full response body before forwarding -- but an SSE stream (the RC
     # inbound channel, and streamed inference) never completes, so events would
-    # pile up in the proxy and never reach the client. Setting stream=True flushes
-    # chunks through as they arrive.
+    # pile up in the proxy and never reach the client. Setting stream flushes
+    # chunks through as they arrive; assigning a function rewrites each chunk.
     if flow.request.pretty_host != SCOPED_HOST:
         return
     ct = flow.response.headers.get("content-type", "")
-    if "text/event-stream" in ct or flow.request.path.split("?", 1)[0].endswith("/events/stream"):
+    path = flow.request.path.split("?", 1)[0]
+    if not ("text/event-stream" in ct or path.endswith("/events/stream")):
+        return
+    # Only rewrite the inbound RC events channel; leave inference SSE untouched.
+    if STRIP_MSG_TIMESTAMP and "/events" in path:
+        flow.response.stream = _strip_msg_timestamp
+        mode = "STREAM+strip-ts"
+    else:
         flow.response.stream = True
-        if DEBUG:
-            logger.info("STREAM %s (content-type=%s)", flow.request.path.split("?", 1)[0], ct or "-")
+        mode = "STREAM"
+    if DEBUG:
+        logger.info("%s %s (content-type=%s)", mode, path, ct or "-")

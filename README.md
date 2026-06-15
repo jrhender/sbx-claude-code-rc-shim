@@ -44,6 +44,26 @@ Two extra details that matter for a real (multiplexing) client:
   401s with `Invalid bearer token`.
 - **SSE responses are streamed** (`flow.response.stream = True`) so the RC inbound
   event channel (and streamed inference) isn't buffered by the proxy.
+- **The server-injected "message sent" timestamp is stripped** from inbound RC
+  messages (see below).
+
+## Inbound message timestamp stripping
+
+Messages sent from a remote client (e.g. the mobile app) arrive on the events SSE
+stream prefixed, **server-side**, with a reminder line:
+
+```
+<system-reminder>Message sent at Mon 2026-06-15 03:50:14 UTC.</system-reminder>
+/clear
+```
+
+Because that line lands **before** your text, a leading slash-command like `/clear`
+is no longer the first thing in the message and stops being recognised. The prefix
+is injected upstream (it isn't in the local Claude Code bundle), so it travels the
+wire through this shim — which means the shim can remove it. With
+`SHIM_STRIP_MSG_TIMESTAMP=1` (the default) the addon rewrites the inbound events
+stream to drop **only** that one reminder (and its trailing newline); every other
+`system-reminder` is left untouched. Set `SHIM_STRIP_MSG_TIMESTAMP=0` to keep it.
 
 ## Usage
 
@@ -67,6 +87,7 @@ Then run `/remote-control` inside Claude Code.
 | `SBX_FORWARD_PROXY` | `http://gateway.docker.internal:3128` | sbx's injecting forward proxy |
 | `SBX_PROXY_SENTINEL` | `proxy-managed` | placeholder marker that means "inject me" |
 | `SHIM_SCOPED_HOST` | `api.anthropic.com` | host the bypass applies to |
+| `SHIM_STRIP_MSG_TIMESTAMP` | `1` | `1` → strip the server-injected `Message sent at …` reminder from inbound RC messages; `0` → keep it |
 | `SHIM_DEBUG` | unset | `1` → log routing decisions (redacted cred tail) to `shim.log` |
 
 ## Notes

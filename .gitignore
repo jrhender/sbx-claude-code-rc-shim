@@ -1,0 +1,5 @@
+# runtime artifacts
+shim.log
+*.log
+__pycache__/
+*.pyc
